@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thegu5 <58223632+thegu5@users.noreply.github.com>
+Date: Sun, 20 Oct 2024 12:03:53 -0400
+Subject: add back main latency recovery
+
+This adds back the latency recovery system that was removed years ago.
+This removal is the source of the issue dubbed 'aim freeze' by
+players of browser-based FPS games, and is why game developers
+suggest using 'clients' with an extremely outdated version of
+electron. Just for testing for now.
+
+diff --git a/cc/metrics/compositor_timing_history.cc b/cc/metrics/compositor_timing_history.cc
+index c955a632bb643cdfa195943cec82bba9f54e34fa..af9a625b9e1db2f55dc8d8b74d0a8f6d7d78a6a6 100644
+--- a/cc/metrics/compositor_timing_history.cc
++++ b/cc/metrics/compositor_timing_history.cc
+@@ -273,6 +273,15 @@ CompositorTimingHistory::BeginMainFrameQueueToActivateCriticalEstimate() const {
+          BeginMainFrameQueueDurationCriticalEstimate();
+ }
+ 
++base::TimeDelta
++CompositorTimingHistory::BeginMainFrameQueueToActivateNotCriticalEstimate()
++    const {
++  return BeginMainFrameStartToReadyToCommitDurationEstimate() +
++         CommitDurationEstimate() + CommitToReadyToActivateDurationEstimate() +
++         ActivateDurationEstimate() +
++         BeginMainFrameQueueDurationNotCriticalEstimate();
++}
++
+ void CompositorTimingHistory::WillFinishImplFrame(bool needs_redraw) {
+   if (!needs_redraw)
+     SetCompositorDrawingContinuously(false);
+diff --git a/cc/metrics/compositor_timing_history.h b/cc/metrics/compositor_timing_history.h
+index d19e0ed81e4bbe2d26fb46a20f4710cc2b931bce..df47e5394a7f9ee25f1217f83f6496fca7cf76ef 100644
+--- a/cc/metrics/compositor_timing_history.h
++++ b/cc/metrics/compositor_timing_history.h
+@@ -56,6 +56,7 @@ class CC_EXPORT CompositorTimingHistory {
+   base::TimeDelta BeginMainFrameStartToReadyToCommitCriticalEstimate() const;
+   base::TimeDelta BeginMainFrameStartToReadyToCommitNotCriticalEstimate() const;
+   base::TimeDelta BeginMainFrameQueueToActivateCriticalEstimate() const;
++  base::TimeDelta BeginMainFrameQueueToActivateNotCriticalEstimate() const;
+ 
+   // State that affects when events should be expected/recorded/reported.
+   void SetRecordingEnabled(bool enabled);
+@@ -82,6 +83,14 @@ class CC_EXPORT CompositorTimingHistory {
+ 
+   void ClearHistory();
+ 
++  size_t begin_main_frame_start_to_ready_to_commit_sample_count() const {
++    return begin_main_frame_start_to_ready_to_commit_duration_history_
++        .sample_count();
++  }
++  size_t commit_to_ready_to_activate_sample_count() const {
++    return commit_to_ready_to_activate_duration_history_.sample_count();
++  }
++
+   size_t CommitDurationSampleCountForTesting() const;
+ 
+  protected:
+diff --git a/cc/scheduler/scheduler.cc b/cc/scheduler/scheduler.cc
+index a3e477130e5d13b57d1fb843aa7fc24c66094df5..7ee61453c7ad7712974d95e3dbaf4e055bff87cc 100644
+--- a/cc/scheduler/scheduler.cc
++++ b/cc/scheduler/scheduler.cc
+@@ -595,6 +595,23 @@ void Scheduler::BeginImplFrameWithDeadline(const viz::BeginFrameArgs& args) {
+   state_machine_.set_should_defer_invalidation_for_fast_main_frame(
+       main_thread_response_expected_soon);
+ 
++  base::TimeDelta bmf_to_activate_estimate = bmf_to_activate_estimate_critical;
++  if (!begin_main_frame_args_.on_critical_path) {
++    bmf_to_activate_estimate =
++        compositor_timing_history_
++            ->BeginMainFrameQueueToActivateNotCriticalEstimate();
++  }
++  bool can_activate_before_deadline =
++      CanBeginMainFrameAndActivateBeforeDeadline(adjusted_args,
++                                                 bmf_to_activate_estimate, now);
++
++  if (ShouldRecoverMainLatency(adjusted_args, can_activate_before_deadline)) {
++    TRACE_EVENT_INSTANT0("cc", "SkipBeginMainFrameToReduceLatency",
++                         TRACE_EVENT_SCOPE_THREAD);
++    state_machine_.SetSkipNextBeginMainFrameToReduceLatency(true);
++  }
++  skipped_last_frame_to_reduce_latency_ = false;
++
+   BeginImplFrame(adjusted_args, now);
+ }
+ 
+@@ -1020,6 +1037,9 @@ void Scheduler::AsProtozeroInto(
+   state->set_pending_begin_frame_task(!pending_begin_frame_task_.IsCancelled());
+   state->set_skipped_last_frame_missed_exceeded_deadline(
+       skipped_last_frame_missed_exceeded_deadline_);
++  // TODO: patch percetto...?
++  //state->set_skipped_last_frame_to_reduce_latency(
++  //    skipped_last_frame_to_reduce_latency_);
+   state->set_inside_action(
+       SchedulerStateMachine::ActionToProtozeroEnum(inside_action_));
+   state->set_deadline_mode(
+@@ -1053,6 +1073,49 @@ void Scheduler::UpdateCompositorTimingHistoryRecordingEnabled() {
+       state_machine_.visible());
+ }
+ 
++bool Scheduler::ShouldRecoverMainLatency(
++    const viz::BeginFrameArgs& args,
++    bool can_activate_before_deadline) const {
++  DCHECK(!settings_.using_synchronous_renderer_compositor);
++
++  //if (!settings_.enable_main_latency_recovery)
++  //  return false;
++
++  // The main thread is in a low latency mode and there's no need to recover.
++  if (!state_machine_.main_thread_missed_last_deadline())
++    return false;
++
++  // When prioritizing impl thread latency, we currently put the
++  // main thread in a high latency mode. Don't try to fight it.
++  if (state_machine_.ImplLatencyTakesPriority())
++    return false;
++
++  // Ensure that we have data from at least one frame before attempting latency
++  // recovery. This prevents skipping of frames during loading where the main
++  // thread is likely slow but we assume it to be fast since we have no history.
++  static const int kMinNumberOfSamplesBeforeLatencyRecovery = 1;
++  if (compositor_timing_history_
++              ->begin_main_frame_start_to_ready_to_commit_sample_count() <
++          kMinNumberOfSamplesBeforeLatencyRecovery ||
++      compositor_timing_history_->commit_to_ready_to_activate_sample_count() <
++          kMinNumberOfSamplesBeforeLatencyRecovery) {
++    return false;
++  }
++
++  return can_activate_before_deadline;
++}
++
++bool Scheduler::CanBeginMainFrameAndActivateBeforeDeadline(
++    const viz::BeginFrameArgs& args,
++    base::TimeDelta bmf_to_activate_estimate,
++    base::TimeTicks now) const {
++  // Check if the main thread computation and commit can be finished before the
++  // impl thread's deadline.
++  base::TimeTicks estimated_draw_time = now + bmf_to_activate_estimate;
++
++  return estimated_draw_time < args.deadline;
++}
++
+ size_t Scheduler::CommitDurationSampleCountForTesting() const {
+   return compositor_timing_history_
+       ->CommitDurationSampleCountForTesting();  // IN-TEST
+@@ -1064,6 +1127,7 @@ viz::BeginFrameAck Scheduler::CurrentBeginFrameAckForActiveTree() const {
+ 
+ void Scheduler::ClearHistory() {
+   // Ensure we reset decisions based on history from the previous navigation.
++  state_machine_.SetSkipNextBeginMainFrameToReduceLatency(false);
+   compositor_timing_history_->ClearHistory();
+   ProcessScheduledActions();
+ }
+diff --git a/cc/scheduler/scheduler.h b/cc/scheduler/scheduler.h
+index 9dcea7c50023ca1a4d61966876fcf35a630b26f7..c5068e8fa7f632adf134c5eb0382d5ae72eb39ae 100644
+--- a/cc/scheduler/scheduler.h
++++ b/cc/scheduler/scheduler.h
+@@ -296,6 +296,7 @@ class CC_EXPORT Scheduler : public viz::BeginFrameObserverBase {
+   bool observing_begin_frame_source_ = false;
+ 
+   bool skipped_last_frame_missed_exceeded_deadline_ = false;
++  bool skipped_last_frame_to_reduce_latency_ = false;
+ 
+   std::unique_ptr<CompositorTimingHistory> compositor_timing_history_;
+ 
+@@ -386,6 +387,14 @@ class CC_EXPORT Scheduler : public viz::BeginFrameObserverBase {
+   void UpdateDisplayTree();
+   void ProcessScheduledActions();
+   void UpdateCompositorTimingHistoryRecordingEnabled();
++
++  bool ShouldRecoverMainLatency(const viz::BeginFrameArgs& args,
++                                bool can_activate_before_deadline) const;
++  bool CanBeginMainFrameAndActivateBeforeDeadline(
++      const viz::BeginFrameArgs& args,
++      base::TimeDelta bmf_to_activate_estimate,
++      base::TimeTicks now) const;
++
+   void AdvanceCommitStateIfPossible();
+ 
+   void BeginImplFrameWithDeadline(const viz::BeginFrameArgs& args);
+diff --git a/cc/scheduler/scheduler_state_machine.cc b/cc/scheduler/scheduler_state_machine.cc
+index 789f732fdf15d1a542789f873164cbfb5449e95e..4333fb96b6871505e5c6290a28deb92946626323 100644
+--- a/cc/scheduler/scheduler_state_machine.cc
++++ b/cc/scheduler/scheduler_state_machine.cc
+@@ -264,6 +264,8 @@ void SchedulerStateMachine::AsProtozeroInto(
+       critical_begin_main_frame_to_activate_is_fast_);
+   minor_state->set_main_thread_missed_last_deadline(
+       main_thread_missed_last_deadline_);
++  //minor_state->set_skip_next_begin_main_frame_to_reduce_latency(
++  //    skip_next_begin_main_frame_to_reduce_latency_);
+   minor_state->set_video_needs_begin_frames(video_needs_begin_frames_);
+   minor_state->set_defer_begin_main_frame(defer_begin_main_frame_);
+   minor_state->set_last_commit_had_no_updates(last_commit_had_no_updates_);
+@@ -662,7 +664,8 @@ bool SchedulerStateMachine::ShouldSendBeginMainFrame() const {
+       did_submit_in_last_frame_;
+   if (IsDrawThrottled() && !just_submitted_in_deadline)
+     return false;
+-
++  if (skip_next_begin_main_frame_to_reduce_latency_)
++    return false;
+   // We should wait for scroll events to arrive before sending the
+   // BeginMainFrame. So that the most up to date scroll positions are available
+   // for main-thread effects.
+@@ -1183,6 +1186,13 @@ void SchedulerStateMachine::WillInvalidateLayerTreeFrameSink() {
+       current_frame_number_;
+ }
+ 
++void SchedulerStateMachine::SetSkipNextBeginMainFrameToReduceLatency(
++    bool skip) {
++  TRACE_EVENT_INSTANT0("cc", "Scheduler: SkipNextBeginMainFrameToReduceLatency",
++                       TRACE_EVENT_SCOPE_THREAD);
++  skip_next_begin_main_frame_to_reduce_latency_ = skip;
++}
++
+ bool SchedulerStateMachine::BeginFrameNeededForVideo() const {
+   return video_needs_begin_frames_;
+ }
+@@ -1370,6 +1380,8 @@ void SchedulerStateMachine::OnBeginImplFrameIdle() {
+   // This is same as the old prepare tiles funnel behavior.
+   did_prepare_tiles_ = false;
+ 
++  skip_next_begin_main_frame_to_reduce_latency_ = false;
++
+   // If a new or undrawn active tree is pending after the deadline,
+   // then the main thread is in a high latency mode.
+   main_thread_missed_last_deadline_ =
+@@ -1571,6 +1583,14 @@ void SchedulerStateMachine::SetNeedsUpdateDisplayTree() {
+   did_update_display_tree_ = false;
+ }
+ 
++bool SchedulerStateMachine::OnlyImplSideUpdatesExpected() const {
++  bool has_impl_updates = needs_redraw_ || needs_one_begin_impl_frame_;
++  bool main_updates_expected =
++      needs_begin_main_frame_ ||
++      begin_main_frame_state_ != BeginMainFrameState::IDLE || has_pending_tree_;
++  return has_impl_updates && !main_updates_expected;
++}
++
+ void SchedulerStateMachine::SetNeedsPrepareTiles() {
+   if (!needs_prepare_tiles_) {
+     TRACE_EVENT0("cc", "SchedulerStateMachine::SetNeedsPrepareTiles");
+diff --git a/cc/scheduler/scheduler_state_machine.h b/cc/scheduler/scheduler_state_machine.h
+index 6dea141cf10c98d53e2b0bf2a55ee3086093495c..4dc72c60e02eedb32ac25a154528554ab3828ad4 100644
+--- a/cc/scheduler/scheduler_state_machine.h
++++ b/cc/scheduler/scheduler_state_machine.h
+@@ -239,6 +239,8 @@ class CC_EXPORT SchedulerStateMachine {
+     return did_invalidate_layer_tree_frame_sink_;
+   }
+ 
++  bool OnlyImplSideUpdatesExpected() const;
++
+   // Indicates that prepare-tiles is required. This guarantees another
+   // PrepareTiles will occur shortly (even if no redraw is required).
+   void SetNeedsPrepareTiles();
+@@ -287,6 +289,9 @@ class CC_EXPORT SchedulerStateMachine {
+   // from NextAction if the client rejects the BeginMainFrame message.
+   void BeginMainFrameAborted(CommitEarlyOutReason reason);
+ 
++  // Indicates production should be skipped to recover latency.
++  void SetSkipNextBeginMainFrameToReduceLatency(bool skip);
++
+   // For Android WebView, resourceless software draws are allowed even when
+   // invisible.
+   void SetResourcelessSoftwareDraw(bool resourceless_draw);
+@@ -493,6 +498,7 @@ class CC_EXPORT SchedulerStateMachine {
+       ScrollHandlerState::SCROLL_DOES_NOT_AFFECT_SCROLL_HANDLER;
+   bool critical_begin_main_frame_to_activate_is_fast_ = true;
+   bool main_thread_missed_last_deadline_ = false;
++  bool skip_next_begin_main_frame_to_reduce_latency_ = false;
+   bool defer_begin_main_frame_ = false;
+   bool pause_rendering_ = false;
+   bool waiting_for_activation_after_rendering_resumed_ = false;
