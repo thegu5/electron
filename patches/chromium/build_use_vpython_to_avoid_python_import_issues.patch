@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thegu5 <58223632+thegu5@users.noreply.github.com>
+Date: Sun, 30 Mar 2025 12:18:14 -0400
+Subject: build: use vpython to avoid python import issues
+
+System-wide python packages seem to sometimes
+mess with imports of google.protobuf.
+Also see: https://issues.chromium.org/issues/40836511#comment22
+
+diff --git a/.gn b/.gn
+index 9effa81a564c3d2afae3eb2bb7438635e45f124a..57ac9a6e7c04de368bd78c08332b2d62d1c9a0ea 100644
+--- a/.gn
++++ b/.gn
+@@ -10,7 +10,7 @@ buildconfig = "//build/config/BUILDCONFIG.gn"
+ 
+ # The python interpreter to use by default. On Windows, this will look
+ # for python3.exe and python3.bat.
+-script_executable = "python3"
++script_executable = "vpython3"
+ 
+ # These arguments override the default values for items in a declare_args
+ # block. "gn args" in turn can override these.
