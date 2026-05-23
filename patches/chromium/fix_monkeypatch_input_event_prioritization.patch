@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thegu5 <58223632+thegu5@users.noreply.github.com>
+Date: Sat, 29 Mar 2025 21:41:45 -0400
+Subject: fix: monkeypatch input event prioritization
+
+This fixes the bug commonly referred to as 'aim freeze' - when fps
+is uncapped, dragging mouse0 makes the main thread ignore IPC messages
+(websockets, workers) for extended periods of time.
+
+diff --git a/third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.cc b/third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.cc
+index 52b7ddfc4a931edb62bff2d30dc7d40aaf2fa344..aad928d66be6f61b165529646e1cff10b5841361 100644
+--- a/third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.cc
++++ b/third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.cc
+@@ -1049,7 +1049,7 @@ bool MainThreadSchedulerImpl::ShouldPrioritizeInputEvent(
+        web_input_event.GetType() == blink::WebInputEvent::Type::kMouseMove) &&
+       (web_input_event.GetModifiers() &
+        blink::WebInputEvent::kLeftButtonDown)) {
+-    return true;
++    return false;
+   }
+   // Ignore all other mouse events because they probably don't signal user
+   // interaction needing a smooth framerate. NOTE isMouseEventType returns false
+@@ -1060,7 +1060,7 @@ bool MainThreadSchedulerImpl::ShouldPrioritizeInputEvent(
+       blink::WebInputEvent::IsKeyboardEventType(web_input_event.GetType())) {
+     return false;
+   }
+-  return true;
++  return false;
+ }
+ 
+ void MainThreadSchedulerImpl::DidHandleInputEventOnCompositorThread(
